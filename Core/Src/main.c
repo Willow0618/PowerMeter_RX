@@ -42,7 +42,7 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 
-#define NRF_PAIR_ID 3u
+#define NRF_PAIR_ID 5u
 
 static const uint8_t nrf_pair_addrs[][6] = {
   {0x12, 0x34, 0x56, 0x78, 0x9A}, // ID0
@@ -63,7 +63,9 @@ static const uint8_t nrf_pair_addrs[][6] = {
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-
+static uint16_t tx_battery_voltage = 0;  // TX电池电压 (0.1V单位，75=7.5V)
+static uint8_t  tx_low_voltage_alarm = 0; // TX低压报警标志
+static uint32_t alarm_beep_counter = 0;   // 报警蜂鸣计数器
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -252,6 +254,17 @@ int main(void)
       }
 
       if (rx_data[0] == 0xAA) {
+        // 解析TX电池电压 (tx_data[1]是高8位，tx_data[2]是低8位，单位0.1V)
+        tx_battery_voltage = ((uint16_t)rx_data[1] << 8) | rx_data[2];
+        printf("[RX] TX Battery Voltage: %d.%dV\r\n", tx_battery_voltage / 10, tx_battery_voltage % 10);
+        
+        // 检查TX电池电压是否低于7.5V (75 = 7.5V)
+        if (tx_battery_voltage > 0 && tx_battery_voltage < 75) {
+          tx_low_voltage_alarm = 1;
+        } else {
+          tx_low_voltage_alarm = 0;
+        }
+        
         if (rx_data[3] == 0x01) {
           HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5, GPIO_PIN_SET);
           // 开机提示音：单次长响
@@ -266,6 +279,30 @@ int main(void)
           RX_Beep(50);
         }
       }
+    }
+
+    // ===== TX电池低压报警逻辑 (两短一长) =====
+    if (tx_low_voltage_alarm) {
+      alarm_beep_counter++;
+      // 报警周期：约 600ms 一次两短一长
+      // 两短一长：50ms + 50ms(停) + 50ms + 200ms = 350ms 响，周期约600ms
+      uint32_t beep_pos = alarm_beep_counter % 12;  // 12*50ms = 600ms 周期
+      
+      // 两短：第1个50ms和第3个50ms，第2个和第4个50ms是间隔
+      // 一长：第5-9个50ms (共250ms)
+      if (beep_pos == 0 || beep_pos == 2) {
+        // 短响
+        HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
+      } else if (beep_pos >= 4 && beep_pos < 9) {
+        // 长响：第5-9个50ms (共250ms)
+        HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
+      } else {
+        HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_2);
+      }
+    } else {
+      // 清除报警状态，关闭蜂鸣器
+      HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_2);
+      alarm_beep_counter = 0;
     }
 
     if (++power_counter >= 20)

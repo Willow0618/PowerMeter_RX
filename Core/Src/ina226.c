@@ -240,7 +240,7 @@ float INA226_ReadPower(void)
 /**
   * @brief  OLED 两行显示：
   *         第1行: x max:xx.xxA  (ID只显示数字，最大电流2位小数)
-  *         第2行: xx.xxW  xx.xxV  (功率和电压都2位小数)
+  *         第2行: xx.xxxW  xx.xxxV  (功率和电压都2位小数)
   * @param  id      设备ID编号
   */
 void INA226_ShowPower(uint8_t id)
