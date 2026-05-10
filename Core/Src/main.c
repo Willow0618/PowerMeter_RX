@@ -1,0 +1,361 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Main program body
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2026 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+#include "i2c.h"
+#include "spi.h"
+#include "tim.h"
+#include "usart.h"
+#include "gpio.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#include <stdio.h>
+#include "OLED.h"
+#include "OLED_Font.h"
+#include "nrf24l01p.h"
+#include "ina226.h"
+#include "stm32f1xx_hal_flash.h"
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+
+#define NRF_PAIR_ID 3u
+
+static const uint8_t nrf_pair_addrs[][6] = {
+  {0x12, 0x34, 0x56, 0x78, 0x9A}, // ID0
+  {0xA1, 0xB2, 0xC3, 0xD4, 0xE5}, // ID1
+  {0x55, 0x66, 0x77, 0x88, 0x99}, // ID2
+  {0xAB, 0xCD, 0xEF, 0x11, 0x22}, // ID3
+  {0x13, 0x57, 0x9B, 0xDF, 0x24}, // ID4
+  {0x14, 0x58, 0x97, 0xD1, 0x25}, // ID5
+};
+
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+
+/* USER CODE BEGIN PV */
+
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+/* USER CODE BEGIN PFP */
+
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+
+void NRF_Force_Set_Addr(uint8_t reg, uint8_t* addr) {
+  uint8_t tx_buf[6];
+  tx_buf[0] = NRF24L01P_CMD_W_REGISTER | reg;
+  for(int i=0; i<5; i++) tx_buf[i+1] = addr[i];
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_RESET);
+  HAL_SPI_Transmit(&hspi1, tx_buf, 6, 100);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_SET);
+}
+
+// 为 RX 板添加蜂鸣器驱动函数 (控制 PB3)
+void RX_Beep(uint16_t duration_ms) {
+  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2); // 启动 TIM2 的通道 2 输出 PWM
+  HAL_Delay(duration_ms);
+  HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_2);  // 停止 PWM 输出
+}
+
+void nrf24l01p_print_status(void)
+{
+  uint8_t status = nrf24l01p_get_status();
+  uint8_t config = NRF_Force_Read_Reg(NRF24L01P_REG_CONFIG);
+  uint8_t rf_ch = NRF_Force_Read_Reg(NRF24L01P_REG_RF_CH);
+  uint8_t setup_aw = NRF_Force_Read_Reg(NRF24L01P_REG_SETUP_AW);
+  uint8_t en_aa = NRF_Force_Read_Reg(NRF24L01P_REG_EN_AA);
+  uint8_t en_rxaddr = NRF_Force_Read_Reg(NRF24L01P_REG_EN_RXADDR);
+  uint8_t rx_addr[5], tx_addr[5];
+
+  nrf24l01p_read_registers(NRF24L01P_REG_RX_ADDR_P0, rx_addr, 5);
+  nrf24l01p_read_registers(NRF24L01P_REG_TX_ADDR, tx_addr, 5);
+
+  printf("[NRF DEBUG] STATUS=0x%02X CONFIG=0x%02X RF_CH=%u EN_AA=0x%02X EN_RXADDR=0x%02X SETUP_AW=0x%02X\n",
+         status, config, rf_ch, en_aa, en_rxaddr, setup_aw);
+  printf("[NRF DEBUG] RX_ADDR_P0=%02X%02X%02X%02X%02X TX_ADDR=%02X%02X%02X%02X%02X\n",
+         rx_addr[0], rx_addr[1], rx_addr[2], rx_addr[3], rx_addr[4],
+         tx_addr[0], tx_addr[1], tx_addr[2], tx_addr[3], tx_addr[4]);
+}
+
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+
+  /* USER CODE BEGIN 1 */
+
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
+
+  /* USER CODE BEGIN Init */
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8 | GPIO_PIN_9, GPIO_PIN_SET); // 强制拉高 SCL/SDA
+  HAL_Delay(100);
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
+  SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_I2C1_Init();
+  MX_SPI1_Init();
+  MX_USART1_UART_Init();
+  MX_TIM2_Init();
+  MX_I2C2_Init();
+  /* USER CODE BEGIN 2 */
+  __HAL_RCC_AFIO_CLK_ENABLE();
+  // 【黄金上电延时】
+  // 等待电源电压彻底稳定，等待 NRF24L01 和 INA226 芯片完成内部上电复位
+  HAL_Delay(200);
+  // OLED 初始化（之前未调用，导致屏幕黑屏）
+  OLED_Init();
+  OLED_Clear();
+  printf("\r\n--- Power RX Board Listening ---\r\n");
+
+  // ID 显示现在由 INA226_ShowPower 统一管理
+
+  // 1. 初始化 NRF (1Mbps)
+  nrf24l01p_rx_init(2500, _1Mbps);
+  // ===================== 终极安全底层配置 =====================
+  // 1. 安全解锁特性寄存器
+  uint8_t feature = NRF_Force_Read_Reg(NRF24L01P_REG_FEATURE);
+  if ((feature & 0x06) != 0x06) {
+    NRF_Force_Write_Reg(NRF24L01P_REG_FEATURE, 0x06);
+    if ((NRF_Force_Read_Reg(NRF24L01P_REG_FEATURE) & 0x06) != 0x06) {
+      uint8_t activate_cmd[2] = {0x50, 0x73};
+      HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_RESET);
+      HAL_SPI_Transmit(&hspi1, activate_cmd, 2, 100);
+      HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_SET);
+      NRF_Force_Write_Reg(NRF24L01P_REG_FEATURE, 0x06);
+    }
+  }
+
+  // 2. 覆盖带 Bug 的库函数
+  NRF_Force_Write_Reg(NRF24L01P_REG_SETUP_RETR, 0x5F); // 匹配 TX
+  NRF_Force_Write_Reg(NRF24L01P_REG_EN_AA, 0x01);
+  NRF_Force_Write_Reg(NRF24L01P_REG_DYNPD, 0x01);
+  NRF_Force_Write_Reg(NRF24L01P_REG_EN_RXADDR, 0x01);
+  NRF_Force_Write_Reg(NRF24L01P_REG_RX_PW_P0, 8);      // 强制 8 字节，防乱码
+
+  // 3. 配置地址
+  const uint8_t *rx_addr = nrf_pair_addrs[NRF_PAIR_ID];
+  NRF_Force_Set_Addr(NRF24L01P_REG_RX_ADDR_P0, (uint8_t *)rx_addr);
+  NRF_Force_Set_Addr(NRF24L01P_REG_TX_ADDR, (uint8_t *)rx_addr); // 极其关键！应答数据必须发往这个地址
+
+  // 4. 屏蔽中断引脚
+  uint8_t config = NRF_Force_Read_Reg(NRF24L01P_REG_CONFIG);
+  config |= 0x70;
+  NRF_Force_Write_Reg(NRF24L01P_REG_CONFIG, config);
+
+  nrf24l01p_flush_rx_fifo();
+  nrf24l01p_flush_tx_fifo();
+  NRF_Force_Write_Reg(NRF24L01P_REG_STATUS, 0x70);
+
+  // 5. 预装填第一发返回数据
+  uint8_t init_ack[8] = {0xBB, 0, 0, 0, 0, 0, 0, 0};
+  nrf24l01p_write_ack_payload(0, init_ack);
+
+  nrf24l01p_prx_mode();
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_SET);
+
+  RX_Beep(100);
+
+  if (HAL_I2C_GetState(&hi2c2) != HAL_I2C_STATE_READY) {
+    __HAL_RCC_I2C2_FORCE_RESET();
+    HAL_Delay(2);
+    __HAL_RCC_I2C2_RELEASE_RESET();
+    MX_I2C2_Init();
+  }
+  INA226_Init();
+
+  uint8_t rx_data[8];
+  uint32_t power_counter = 0;
+  float global_power_f = 0.0f;
+
+  /* USER CODE END 2 */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+    HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_12);
+
+    uint8_t status = NRF_Force_Read_Reg(NRF24L01P_REG_STATUS);
+    if (status & 0x40) {
+      // 不调用带中断控制的 rx_receive，直接使用最底层的读取
+      nrf24l01p_read_rx_fifo(rx_data);
+
+      // 打印 RX 收到的 TX 发送数据
+      printf("[RX] Recv DATA: %02X %02X %02X %02X %02X %02X %02X %02X\r\n",
+             rx_data[0], rx_data[1], rx_data[2], rx_data[3],
+             rx_data[4], rx_data[5], rx_data[6], rx_data[7]);
+
+      NRF_Force_Write_Reg(NRF24L01P_REG_STATUS, 0x70); // 清空标志位
+      nrf24l01p_flush_rx_fifo();
+
+      // 乘 1000，把单位变成毫瓦 (mW)
+      // 比如 0.020W * 1000 = 20mW。这样强转整数就不会丢
+      uint16_t pwr_int = (uint16_t)(global_power_f * 1000.0f);
+      // 直接去读控制 MOS 管的引脚的真实物理状态
+      uint8_t mos_state = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_5);
+      // 把 mos_state 塞到第 4 个位置（也就是索引 [3]）
+      uint8_t ack_payload[8] = {0xBB, (uint8_t)(pwr_int >> 8), (uint8_t)(pwr_int & 0xFF), mos_state, 0, 0, 0, 0};
+
+      if ((NRF_Force_Read_Reg(NRF24L01P_REG_FIFO_STATUS) & 0x20) == 0) {
+        nrf24l01p_write_ack_payload(0, ack_payload);
+      }
+
+      if (rx_data[0] == 0xAA) {
+        if (rx_data[3] == 0x01) {
+          HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5, GPIO_PIN_SET);
+          // 开机提示音：单次长响
+          RX_Beep(100);
+        }
+        else if (rx_data[3] == 0x00) {
+          HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5, GPIO_PIN_RESET);
+          INA226_ResetMaxCurrent();  // MOS 关闭时重置最大电流记录
+          // 关机提示音：两次短响
+          RX_Beep(50);
+          HAL_Delay(50);
+          RX_Beep(50);
+        }
+      }
+    }
+
+    if (++power_counter >= 20)
+    {
+      power_counter = 0;
+      INA226_ShowPower(NRF_PAIR_ID);
+
+      global_power_f = INA226_ReadPower();
+      if (global_power_f > 10.0f) {
+        RX_Beep(500);
+      }
+    }
+    HAL_Delay(50); // 适度轮询延时，保持极高的按键响应灵敏度
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+  }
+  /* USER CODE END 3 */
+}
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.HSEPredivValue = RCC_HSE_PREDIV_DIV1;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL9;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/* USER CODE BEGIN 4 */
+
+/* USER CODE END 4 */
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
+  __disable_irq();
+  while (1)
+  {
+  }
+  /* USER CODE END Error_Handler_Debug */
+}
+#ifdef USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* USER CODE BEGIN 6 */
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */
