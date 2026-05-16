@@ -87,10 +87,55 @@ void NRF_Force_Set_Addr(uint8_t reg, uint8_t* addr) {
 }
 
 // 为 RX 板添加蜂鸣器驱动函数 (控制 PB3)
+// 非阻塞式蜂鸣器控制变量
+static uint32_t beep_end_time = 0;
+static uint8_t beep_active = 0;
+static uint8_t beep_sequence_step = 0;
+static uint32_t beep_sequence_delay = 0;
+
+void RX_Beep_Start(uint16_t duration_ms) {
+  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
+  beep_end_time = HAL_GetTick() + duration_ms;
+  beep_active = 1;
+  beep_sequence_step = 0; // 重置序列
+}
+
+// 关机提示音序列：50ms响，50ms停，50ms响
+void RX_Beep_Shutdown_Sequence(void) {
+  if (!beep_active) {
+    beep_sequence_step = 1; // 第一步：开始第一个蜂鸣
+    beep_end_time = HAL_GetTick() + 50;
+    beep_active = 1;
+    HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
+  }
+}
+
+void RX_Beep_Update(void) {
+  if (beep_active) {
+    if (HAL_GetTick() >= beep_end_time) {
+      if (beep_sequence_step == 1) {
+        // 第一步结束，开始50ms间隔
+        HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_2);
+        beep_sequence_step = 2;
+        beep_end_time = HAL_GetTick() + 50;
+      } else if (beep_sequence_step == 2) {
+        // 间隔结束，开始第二个蜂鸣
+        HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
+        beep_sequence_step = 3;
+        beep_end_time = HAL_GetTick() + 50;
+      } else {
+        // 序列结束或单次蜂鸣结束
+        HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_2);
+        beep_active = 0;
+        beep_sequence_step = 0;
+      }
+    }
+  }
+}
+
+// 兼容旧代码
 void RX_Beep(uint16_t duration_ms) {
-  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2); // 启动 TIM2 的通道 2 输出 PWM
-  HAL_Delay(duration_ms);
-  HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_2);  // 停止 PWM 输出
+  RX_Beep_Start(duration_ms);
 }
 
 void nrf24l01p_print_status(void)
@@ -265,18 +310,26 @@ int main(void)
           tx_low_voltage_alarm = 0;
         }
         
-        if (rx_data[3] == 0x01) {
-          HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5, GPIO_PIN_SET);
-          // 开机提示音：单次长响
-          RX_Beep(100);
-        }
-        else if (rx_data[3] == 0x00) {
+        // 命令优先级处理：关机命令最高优先级
+        if (rx_data[3] == 0x00) { // 关机命令
           HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5, GPIO_PIN_RESET);
           INA226_ResetMaxCurrent();  // MOS 关闭时重置最大电流记录
-          // 关机提示音：两次短响
-          RX_Beep(50);
-          HAL_Delay(50);
-          RX_Beep(50);
+          // 立即停止任何正在进行的蜂鸣
+          if (beep_active) {
+            HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_2);
+            beep_active = 0;
+            beep_sequence_step = 0;
+          }
+          // 关机提示音：两次短响序列
+          RX_Beep_Shutdown_Sequence();
+          printf("[RX] Shutdown command executed (high priority)\r\n");
+        }
+        else if (rx_data[3] == 0x01) { // 开机命令
+          HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5, GPIO_PIN_SET);
+          // 开机提示音：单次长响（非阻塞）
+          if (!beep_active) {
+            RX_Beep_Start(100);
+          }
         }
       }
     }
@@ -291,17 +344,26 @@ int main(void)
       // 两短：第1个50ms和第3个50ms，第2个和第4个50ms是间隔
       // 一长：第5-9个50ms (共250ms)
       if (beep_pos == 0 || beep_pos == 2) {
-        // 短响
-        HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
+        // 短响 - 只有在没有其他蜂鸣时才响
+        if (!beep_active) {
+          HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
+        }
       } else if (beep_pos >= 4 && beep_pos < 9) {
-        // 长响：第5-9个50ms (共250ms)
-        HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
+        // 长响：第5-9个50ms (共250ms) - 只有在没有其他蜂鸣时才响
+        if (!beep_active) {
+          HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
+        }
       } else {
-        HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_2);
+        // 只有在没有其他蜂鸣时才停止
+        if (!beep_active) {
+          HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_2);
+        }
       }
     } else {
-      // 清除报警状态，关闭蜂鸣器
-      HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_2);
+      // 清除报警状态，关闭蜂鸣器（只有在没有其他蜂鸣时才停止）
+      if (!beep_active) {
+        HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_2);
+      }
       alarm_beep_counter = 0;
     }
 
@@ -312,9 +374,30 @@ int main(void)
 
       global_power_f = INA226_ReadPower();
       if (global_power_f > 10.0f) {
-        RX_Beep(500);
+        // 非阻塞蜂鸣，避免系统阻塞
+        if (!beep_active) {
+          RX_Beep_Start(500);
+        }
+        
+        // 紧急情况：如果功率持续过大，考虑自动保护
+        static uint8_t over_power_count = 0;
+        over_power_count++;
+        if (over_power_count > 10) { // 连续10次检测到过功率（约10秒）
+          // 自动关闭输出作为保护
+          HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5, GPIO_PIN_RESET);
+          printf("[EMERGENCY] Auto shutdown due to sustained over-power!\r\n");
+          over_power_count = 0;
+        }
+      } else {
+        // 重置过功率计数
+        static uint8_t over_power_count = 0;
+        over_power_count = 0;
       }
     }
+    
+    // 更新非阻塞蜂鸣器状态
+    RX_Beep_Update();
+    
     HAL_Delay(50); // 适度轮询延时，保持极高的按键响应灵敏度
     /* USER CODE END WHILE */
 
