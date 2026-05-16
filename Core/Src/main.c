@@ -42,7 +42,7 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 
-#define NRF_PAIR_ID 6u
+#define NRF_PAIR_ID 5u
 
 static const uint8_t nrf_pair_addrs[][7] = {
   {0x12, 0x34, 0x56, 0x78, 0x9A}, // ID0
@@ -67,6 +67,12 @@ static const uint8_t nrf_pair_addrs[][7] = {
 static uint16_t tx_battery_voltage = 0;  // TX电池电压 (0.1V单位，75=7.5V)
 static uint8_t  tx_low_voltage_alarm = 0; // TX低压报警标志
 static uint32_t alarm_beep_counter = 0;   // 报警蜂鸣计数器
+
+// NRF24L01通信监控变量
+static uint32_t nrf_last_rx_time = 0;
+static uint8_t  nrf_recovery_count = 0;
+static uint32_t nrf_health_check_time = 0;
+static uint32_t nrf_status_check_time = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -138,6 +144,68 @@ void RX_Beep_Update(void) {
 void RX_Beep(uint16_t duration_ms) {
   RX_Beep_Start(duration_ms);
 }
+
+// ===================== NRF24L01 通信监控函数 =====================
+
+// NRF状态检查回调（每5秒调用一次）
+void NRF_Status_Check(void) {
+  if (HAL_GetTick() - nrf_status_check_time > 5000) {
+    nrf_status_check_time = HAL_GetTick();
+    uint8_t status = NRF_Force_Read_Reg(NRF24L01P_REG_STATUS);
+    printf("[NRF] STATUS=0x%02X\r\n", status);
+  }
+}
+
+// NRF健康检查和自动恢复（每30秒调用一次）
+void NRF_Health_Check(void) {
+  if (HAL_GetTick() - nrf_health_check_time > 30000) {
+    nrf_health_check_time = HAL_GetTick();
+    
+    uint8_t config = NRF_Force_Read_Reg(NRF24L01P_REG_CONFIG);
+    uint8_t en_rxaddr = NRF_Force_Read_Reg(NRF24L01P_REG_EN_RXADDR);
+    uint8_t fifo = NRF_Force_Read_Reg(NRF24L01P_REG_FIFO_STATUS);
+    
+    uint8_t need_fix = 0;
+    if ((config & 0x03) != 0x03) need_fix = 1;
+    if ((en_rxaddr & 0x01) == 0) need_fix = 1;
+    if ((fifo & 0x11) != 0x00) need_fix = 1;
+    
+    if (need_fix) {
+      printf("[NRF] Health check: needs recovery\r\n");
+      nrf24l01p_flush_rx_fifo();
+      nrf24l01p_flush_tx_fifo();
+      NRF_Force_Write_Reg(NRF24L01P_REG_STATUS, 0x70);
+      config |= 0x03;
+      NRF_Force_Write_Reg(NRF24L01P_REG_CONFIG, config);
+      en_rxaddr |= 0x01;
+      NRF_Force_Write_Reg(NRF24L01P_REG_EN_RXADDR, en_rxaddr);
+    }
+  }
+}
+
+// NRF通信恢复检查（每15秒检查一次）
+void NRF_Recovery_Check(void) {
+  if (nrf_last_rx_time > 0 && HAL_GetTick() - nrf_last_rx_time > 15000) {
+    nrf_recovery_count++;
+    if (nrf_recovery_count >= 2) {
+      printf("[NRF] No RX for 30s, recovering...\r\n");
+      nrf24l01p_flush_rx_fifo();
+      nrf24l01p_flush_tx_fifo();
+      NRF_Force_Write_Reg(NRF24L01P_REG_STATUS, 0x70);
+      nrf24l01p_prx_mode();
+      nrf_recovery_count = 0;
+      nrf_last_rx_time = HAL_GetTick();
+    }
+  }
+}
+
+// 记录收到数据（每次收到数据时调用）
+void NRF_OnDataReceived(void) {
+  nrf_last_rx_time = HAL_GetTick();
+  nrf_recovery_count = 0;
+}
+
+// ===================== 结束 NRF监控 =====================
 
 void nrf24l01p_print_status(void)
 {
@@ -274,11 +342,19 @@ int main(void)
   {
     HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_12);
 
+    // NRF通信监控（状态检查、健康检查、通信恢复）
+    NRF_Status_Check();
+    NRF_Health_Check();
+    NRF_Recovery_Check();
+
     uint8_t status = NRF_Force_Read_Reg(NRF24L01P_REG_STATUS);
     if (status & 0x40) {
       // 不调用带中断控制的 rx_receive，直接使用最底层的读取
       nrf24l01p_read_rx_fifo(rx_data);
 
+      // 记录收到数据
+      NRF_OnDataReceived();
+      
       // 打印 RX 收到的 TX 发送数据
       printf("[RX] Recv DATA: %02X %02X %02X %02X %02X %02X %02X %02X\r\n",
              rx_data[0], rx_data[1], rx_data[2], rx_data[3],
