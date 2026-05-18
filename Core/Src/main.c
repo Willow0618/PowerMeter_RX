@@ -334,6 +334,12 @@ int main(void)
   uint32_t power_counter = 0;
   float global_power_f = 0.0f;
 
+  // ===== 添加物理按键(PA2)状态变量 =====
+  uint8_t  button_state = 0;
+  uint32_t button_press_time = 0;
+  uint8_t  manual_lock_off = 0; // 0: 允许TX控制通断, 1: 物理按键强制关断，拒收TX开机指令
+  // ===================================
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -341,6 +347,57 @@ int main(void)
   while (1)
   {
     HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_12);
+
+    // ===================== 物理按键逻辑 (PA2) =====================
+    uint8_t current_pa2 = HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_2);
+
+    if (current_pa2 == GPIO_PIN_RESET) {
+      // 按键被按下 (低电平有效)
+      if (button_state == 0) {
+        button_state = 1;
+        button_press_time = HAL_GetTick(); // 记录刚刚按下的时刻
+      } else if (button_state == 1) {
+        // 人性化提示：按满2秒时，给一个短促提示音，告诉用户达到长按条件可以松手了
+        if (HAL_GetTick() - button_press_time >= 2000) {
+          button_state = 2; // 标记为已触发长按时间
+          if (!beep_active) {
+            RX_Beep_Start(50);
+          }
+        }
+      }
+    } else {
+      // 按键松开 (高电平)
+      if (button_state == 1 || button_state == 2) {
+        uint32_t press_duration = HAL_GetTick() - button_press_time;
+        button_state = 0; // 重置按键状态
+
+        // 消除抖动 (>30ms 才认为是有效按键)
+        if (press_duration > 30) {
+          if (press_duration < 2000) {
+            // 短按 (<2秒)松开：开机 (PB5 = 高电平)
+            HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5, GPIO_PIN_SET);
+            manual_lock_off = 0;
+            printf("[BUTTON] Short Press -> Power ON\r\n");
+            if (!beep_active) {
+              RX_Beep_Start(100); // 开机提示音
+            }
+          } else {
+            // 长按 (>=2秒)松开：关机 (PB5 = 低电平)
+            HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5, GPIO_PIN_RESET);
+            manual_lock_off = 1; // 【强制锁定】禁止TX将其开机
+            printf("[BUTTON] Long Press -> Power OFF\r\n");
+            // 立即停止其他所有蜂鸣
+            if (beep_active) {
+              HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_2);
+              beep_active = 0;
+              beep_sequence_step = 0;
+            }
+            RX_Beep_Shutdown_Sequence(); // 关机专属提示音
+          }
+        }
+      }
+    }
+    // ===============================================================
 
     // NRF通信监控（状态检查、健康检查、通信恢复）
     NRF_Status_Check();
@@ -366,10 +423,10 @@ int main(void)
       // 乘 1000，把单位变成毫瓦 (mW)
       // 比如 0.020W * 1000 = 20mW。这样强转整数就不会丢
       uint16_t pwr_int = (uint16_t)(global_power_f * 1000.0f);
-      // 直接去读控制 MOS 管的引脚的真实物理状态
-      uint8_t mos_state = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_5);
+      // 获取最新 MOS 状态
+      uint8_t current_mos = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_5);
       // 把 mos_state 塞到第 4 个位置（也就是索引 [3]）
-      uint8_t ack_payload[8] = {0xBB, (uint8_t)(pwr_int >> 8), (uint8_t)(pwr_int & 0xFF), mos_state, 0, 0, 0, 0};
+      uint8_t ack_payload[8] = {0xBB, (uint8_t)(pwr_int >> 8), (uint8_t)(pwr_int & 0xFF), current_mos, 0, 0, 0, 0};
 
       if ((NRF_Force_Read_Reg(NRF24L01P_REG_FIFO_STATUS) & 0x20) == 0) {
         nrf24l01p_write_ack_payload(0, ack_payload);
@@ -386,26 +443,43 @@ int main(void)
         } else {
           tx_low_voltage_alarm = 0;
         }
-        
+
+        // ================= 修复 =================
+        // 只有在【状态确实发生改变】时，才发出动作和蜂鸣器响声
         // 命令优先级处理：关机命令最高优先级
-        if (rx_data[3] == 0x00) { // 关机命令
-          HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5, GPIO_PIN_RESET);
-          INA226_ResetMaxCurrent();  // MOS 关闭时重置最大电流记录
-          // 立即停止任何正在进行的蜂鸣
-          if (beep_active) {
-            HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_2);
-            beep_active = 0;
-            beep_sequence_step = 0;
+        if (rx_data[3] == 0x00)
+        {
+          // 关机命令
+          // TX 试图关机：只有当前是开机状态，才需要动作！
+          if (current_mos == GPIO_PIN_SET) {
+            HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5, GPIO_PIN_RESET);
+            // 注意：这里不再主动重置最大电流，以便断电记忆功能正常工作
+            // 如果需要每次关机都重置最大电流，可以取消下面这行的注释：
+            // INA226_ResetMaxCurrent();
+            // 立即停止任何正在进行的蜂鸣
+            if (beep_active) {
+              HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_2);
+              beep_active = 0;
+              beep_sequence_step = 0;
+            }
+            // 关机提示音：两次短响序列
+            RX_Beep_Shutdown_Sequence();
+            printf("[RX] Shutdown command executed (high priority)\r\n");
           }
-          // 关机提示音：两次短响序列
-          RX_Beep_Shutdown_Sequence();
-          printf("[RX] Shutdown command executed (high priority)\r\n");
         }
-        else if (rx_data[3] == 0x01) { // 开机命令
-          HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5, GPIO_PIN_SET);
-          // 开机提示音：单次长响（非阻塞）
-          if (!beep_active) {
-            RX_Beep_Start(100);
+        else if (rx_data[3] == 0x01) {
+          // TX 试图开机：必须同时满足“未被锁定” 且 “当前是关机状态”，才需要动作！
+          if (manual_lock_off) {
+            // 【核心逻辑】如果物理按键已经将系统锁定关机，则拒绝执行遥控器的开机指令！
+            printf("[RX] Ignored TX Power ON (Manually LOCKED OFF)\r\n");
+          } else {
+            if (current_mos == GPIO_PIN_RESET) {
+              HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5, GPIO_PIN_SET);
+              if (!beep_active) {
+                RX_Beep_Start(100);
+              }
+              printf("[RX] TX Power ON executed\r\n");
+            }
           }
         }
       }
@@ -448,8 +522,9 @@ int main(void)
     {
       power_counter = 0;
       INA226_ShowPower(NRF_PAIR_ID);
-
       global_power_f = INA226_ReadPower();
+      // 【修复】将静态变量定义在 if...else 外部，保证是同一个变量
+      static uint8_t over_power_count = 0;
       if (global_power_f > 10.0f) {
         // 非阻塞蜂鸣，避免系统阻塞
         if (!beep_active) {
@@ -457,17 +532,15 @@ int main(void)
         }
         
         // 紧急情况：如果功率持续过大，考虑自动保护
-        static uint8_t over_power_count = 0;
         over_power_count++;
         if (over_power_count > 10) { // 连续10次检测到过功率（约10秒）
           // 自动关闭输出作为保护
           HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5, GPIO_PIN_RESET);
           printf("[EMERGENCY] Auto shutdown due to sustained over-power!\r\n");
-          over_power_count = 0;
+          over_power_count = 0; // 触发后清零
         }
       } else {
-        // 重置过功率计数
-        static uint8_t over_power_count = 0;
+        // 功率恢复正常，重置过功率计数
         over_power_count = 0;
       }
     }

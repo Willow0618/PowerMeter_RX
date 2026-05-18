@@ -20,7 +20,8 @@
 #define INA226_REG_ID           0xFE    // 厂商 ID (应为 0x5449)
 
 /* Flash 存储配置 (STM32F103 64KB Flash) */
-#define FLASH_USER_START_ADDR   ((uint32_t)0x0800F000)  // 最后1KB空间
+// 最后一页(page 63)的起始地址：0x0800FC00
+#define FLASH_USER_START_ADDR   ((uint32_t)0x0800FC00)  // 最后一页起始地址
 #define FLASH_USER_END_ADDR     ((uint32_t)0x0800FFFF)
 #define FLASH_PAGE_SIZE         1024  // STM32F103 1KB 每页
 #define FLASH_MAGIC_NUMBER      0x55AA1234
