@@ -534,6 +534,18 @@ int main(void)
       power_counter = 0;
       INA226_ShowPower(NRF_PAIR_ID);
       global_power_f = INA226_ReadPower();
+
+      // 动态 I2C2 恢复：INA226_ShowPower 检测到运行时读取失败后会将 ina226_ready 置 0
+      // 此处捕获该状态，对 I2C2 总线执行软件复位并重新初始化 INA226
+      if (!INA226_GetStatus()) {
+        printf("[I2C2] INA226 error detected, resetting I2C2 bus...\r\n");
+        __HAL_RCC_I2C2_FORCE_RESET();
+        HAL_Delay(5);
+        __HAL_RCC_I2C2_RELEASE_RESET();
+        HAL_Delay(5);
+        MX_I2C2_Init();
+        INA226_Init(); // 重新配置 INA226 寄存器（含 CONFIG 和 CALIB）
+      }
       // 【修复】将静态变量定义在 if...else 外部，保证是同一个变量
       static uint8_t over_power_count = 0;
       if (global_power_f > 15.0f) {

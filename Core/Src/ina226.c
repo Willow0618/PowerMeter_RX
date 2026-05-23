@@ -257,6 +257,15 @@ void INA226_ShowPower(uint8_t id)
     float i = INA226_ReadCurrent();  // 内部自动更新最大电流
     float p = INA226_ReadPower();
 
+    // 运行时 I2C 故障检测：任意一路读取返回 -1.0f 即视为总线异常
+    // 将 ina226_ready 置 0，通知主循环执行动态恢复
+    if (v < 0.0f || i < -0.5f || p < 0.0f) {
+        ina226_ready = 0;
+        OLED_ShowString(1, 1, "INA226  ERR     ");
+        OLED_ShowString(2, 1, "                ");
+        return;
+    }
+
     printf("DEBUG: V=%.3fV  I=%.4fA  P=%.4fW  Imax=%.4fA\n",
            v, i, p, ina226_max_current);
 
