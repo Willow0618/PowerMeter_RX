@@ -42,7 +42,7 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 
-#define NRF_PAIR_ID 5u
+#define NRF_PAIR_ID 4u
 
 static const uint8_t nrf_pair_addrs[][7] = {
   {0x12, 0x34, 0x56, 0x78, 0x9A}, // ID0
@@ -183,16 +183,61 @@ void NRF_Health_Check(void) {
   }
 }
 
+// 统一配置应用函数：初始化和恢复时共同调用，确保地址和寄存器完整重载
+void NRF_Apply_Safe_Config(void) {
+  // 1. 安全解锁特性寄存器
+  uint8_t feature = NRF_Force_Read_Reg(NRF24L01P_REG_FEATURE);
+  if ((feature & 0x06) != 0x06) {
+    NRF_Force_Write_Reg(NRF24L01P_REG_FEATURE, 0x06);
+    if ((NRF_Force_Read_Reg(NRF24L01P_REG_FEATURE) & 0x06) != 0x06) {
+      // 发送 ACTIVATE 命令解锁 FEATURE 寄存器（部分克隆芯片需要）
+      uint8_t activate_cmd[2] = {0x50, 0x73};
+      HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_RESET);
+      HAL_SPI_Transmit(&hspi1, activate_cmd, 2, 100);
+      HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_SET);
+      NRF_Force_Write_Reg(NRF24L01P_REG_FEATURE, 0x06);
+    }
+  }
+
+  // 2. 覆盖库函数可能写错的寄存器
+  NRF_Force_Write_Reg(NRF24L01P_REG_SETUP_RETR, 0x5F); // 匹配 TX
+  NRF_Force_Write_Reg(NRF24L01P_REG_EN_AA, 0x01);
+  NRF_Force_Write_Reg(NRF24L01P_REG_DYNPD, 0x01);
+  NRF_Force_Write_Reg(NRF24L01P_REG_EN_RXADDR, 0x01);
+  NRF_Force_Write_Reg(NRF24L01P_REG_RX_PW_P0, 8);      // 强制 8 字节，防乱码
+
+  // 3. 配置配对地址（恢复时最关键的一步，防止 prx_mode 覆盖地址）
+  const uint8_t *rx_addr = nrf_pair_addrs[NRF_PAIR_ID];
+  NRF_Force_Set_Addr(NRF24L01P_REG_RX_ADDR_P0, (uint8_t *)rx_addr);
+  NRF_Force_Set_Addr(NRF24L01P_REG_TX_ADDR, (uint8_t *)rx_addr); // ACK 应答必须发往此地址
+
+  // 4. 屏蔽中断引脚并确保 PRX 模式位正确
+  uint8_t config = NRF_Force_Read_Reg(NRF24L01P_REG_CONFIG);
+  config |= 0x70; // 屏蔽 MAX_RT / TX_DS / RX_DR 中断
+  NRF_Force_Write_Reg(NRF24L01P_REG_CONFIG, config);
+
+  // 5. 清空 FIFO 和状态标志
+  nrf24l01p_flush_rx_fifo();
+  nrf24l01p_flush_tx_fifo();
+  NRF_Force_Write_Reg(NRF24L01P_REG_STATUS, 0x70);
+
+  // 6. 预装填第一发 ACK 返回数据
+  uint8_t init_ack[8] = {0xBB, 0, 0, 0, 0, 0, 0, 0};
+  nrf24l01p_write_ack_payload(0, init_ack);
+
+  // 7. 进入 PRX 模式（在地址写入之后调用，防止库函数覆盖地址）
+  nrf24l01p_prx_mode();
+}
+
 // NRF通信恢复检查（每15秒检查一次）
 void NRF_Recovery_Check(void) {
   if (nrf_last_rx_time > 0 && HAL_GetTick() - nrf_last_rx_time > 15000) {
     nrf_recovery_count++;
     if (nrf_recovery_count >= 2) {
       printf("[NRF] No RX for 30s, recovering...\r\n");
-      nrf24l01p_flush_rx_fifo();
-      nrf24l01p_flush_tx_fifo();
-      NRF_Force_Write_Reg(NRF24L01P_REG_STATUS, 0x70);
-      nrf24l01p_prx_mode();
+      // 调用完整配置函数，确保地址和所有寄存器被正确重载
+      // 不再单独调用 nrf24l01p_prx_mode()，防止其覆盖配对地址
+      NRF_Apply_Safe_Config();
       nrf_recovery_count = 0;
       nrf_last_rx_time = HAL_GetTick();
     }
@@ -278,46 +323,10 @@ int main(void)
 
   // 1. 初始化 NRF (1Mbps)
   nrf24l01p_rx_init(2500, _1Mbps);
-  // ===================== 终极安全底层配置 =====================
-  // 1. 安全解锁特性寄存器
-  uint8_t feature = NRF_Force_Read_Reg(NRF24L01P_REG_FEATURE);
-  if ((feature & 0x06) != 0x06) {
-    NRF_Force_Write_Reg(NRF24L01P_REG_FEATURE, 0x06);
-    if ((NRF_Force_Read_Reg(NRF24L01P_REG_FEATURE) & 0x06) != 0x06) {
-      uint8_t activate_cmd[2] = {0x50, 0x73};
-      HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_RESET);
-      HAL_SPI_Transmit(&hspi1, activate_cmd, 2, 100);
-      HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_SET);
-      NRF_Force_Write_Reg(NRF24L01P_REG_FEATURE, 0x06);
-    }
-  }
 
-  // 2. 覆盖带 Bug 的库函数
-  NRF_Force_Write_Reg(NRF24L01P_REG_SETUP_RETR, 0x5F); // 匹配 TX
-  NRF_Force_Write_Reg(NRF24L01P_REG_EN_AA, 0x01);
-  NRF_Force_Write_Reg(NRF24L01P_REG_DYNPD, 0x01);
-  NRF_Force_Write_Reg(NRF24L01P_REG_EN_RXADDR, 0x01);
-  NRF_Force_Write_Reg(NRF24L01P_REG_RX_PW_P0, 8);      // 强制 8 字节，防乱码
+  // 2. 调用统一安全配置函数（初始化与恢复共用同一套逻辑，保证行为一致）
+  NRF_Apply_Safe_Config();
 
-  // 3. 配置地址
-  const uint8_t *rx_addr = nrf_pair_addrs[NRF_PAIR_ID];
-  NRF_Force_Set_Addr(NRF24L01P_REG_RX_ADDR_P0, (uint8_t *)rx_addr);
-  NRF_Force_Set_Addr(NRF24L01P_REG_TX_ADDR, (uint8_t *)rx_addr); // 极其关键！应答数据必须发往这个地址
-
-  // 4. 屏蔽中断引脚
-  uint8_t config = NRF_Force_Read_Reg(NRF24L01P_REG_CONFIG);
-  config |= 0x70;
-  NRF_Force_Write_Reg(NRF24L01P_REG_CONFIG, config);
-
-  nrf24l01p_flush_rx_fifo();
-  nrf24l01p_flush_tx_fifo();
-  NRF_Force_Write_Reg(NRF24L01P_REG_STATUS, 0x70);
-
-  // 5. 预装填第一发返回数据
-  uint8_t init_ack[8] = {0xBB, 0, 0, 0, 0, 0, 0, 0};
-  nrf24l01p_write_ack_payload(0, init_ack);
-
-  nrf24l01p_prx_mode();
   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_SET);
 
   RX_Beep(100);
@@ -405,7 +414,9 @@ int main(void)
     NRF_Recovery_Check();
 
     uint8_t status = NRF_Force_Read_Reg(NRF24L01P_REG_STATUS);
-    if (status & 0x40) {
+    // 过滤 SPI 异常值：0xFF 表示总线故障（全高），0x00 表示总线故障（全低）
+    // 两者都可能导致误判为"有数据"，从而刷新健康时间、阻止恢复机制触发
+    if (status != 0xFF && status != 0x00 && (status & 0x40)) {
       // 不调用带中断控制的 rx_receive，直接使用最底层的读取
       nrf24l01p_read_rx_fifo(rx_data);
 
@@ -525,7 +536,7 @@ int main(void)
       global_power_f = INA226_ReadPower();
       // 【修复】将静态变量定义在 if...else 外部，保证是同一个变量
       static uint8_t over_power_count = 0;
-      if (global_power_f > 10.0f) {
+      if (global_power_f > 15.0f) {
         // 非阻塞蜂鸣，避免系统阻塞
         if (!beep_active) {
           RX_Beep_Start(500);
