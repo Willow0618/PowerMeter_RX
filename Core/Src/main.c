@@ -42,16 +42,17 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 
-#define NRF_PAIR_ID 4u
+#define NRF_PAIR_ID 0u
 
 static const uint8_t nrf_pair_addrs[][7] = {
-  {0x12, 0x34, 0x56, 0x78, 0x9A}, // ID0
-  {0xA1, 0xB2, 0xC3, 0xD4, 0xE5}, // ID1
-  {0x55, 0x66, 0x77, 0x88, 0x99}, // ID2
-  {0xAB, 0xCD, 0xEF, 0x11, 0x22}, // ID3
-  {0x13, 0x57, 0x9B, 0xDF, 0x24}, // ID4
-  {0x14, 0x58, 0x97, 0xD1, 0x25}, // ID5
-  {0x00, 0x00, 0x00, 0x02, 0x08}, // ID6
+   {0x12, 0x34, 0x56, 0x78, 0x9A}, // ID0
+   {0xA1, 0xB2, 0xC3, 0xD4, 0xE5}, // ID1
+   {0x57, 0x66, 0x72, 0x81, 0x99}, // ID2
+   {0xA6, 0xCD, 0xEC, 0x18, 0x22}, // ID3
+   {0x13, 0x57, 0x9B, 0xDF, 0x24}, // ID4
+   {0x14, 0x58, 0x97, 0xD1, 0x25}, // ID5
+   {0x00, 0x00, 0x00, 0x02, 0x08}, // ID6
+   {0x15, 0x97, 0x9A, 0xDF, 0x74}, // ID7
 };
 
 /* USER CODE END PD */
@@ -383,18 +384,10 @@ int main(void)
         // 消除抖动 (>30ms 才认为是有效按键)
         if (press_duration > 30) {
           if (press_duration < 2000) {
-            // 短按 (<2秒)松开：开机 (PB5 = 高电平)
-            HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5, GPIO_PIN_SET);
-            manual_lock_off = 0;
-            printf("[BUTTON] Short Press -> Power ON\r\n");
-            if (!beep_active) {
-              RX_Beep_Start(100); // 开机提示音
-            }
-          } else {
-            // 长按 (>=2秒)松开：关机 (PB5 = 低电平)
+            // 短按 (<2秒)松开：关机 (PB5 = 低电平)
             HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5, GPIO_PIN_RESET);
             manual_lock_off = 1; // 【强制锁定】禁止TX将其开机
-            printf("[BUTTON] Long Press -> Power OFF\r\n");
+            printf("[BUTTON] Short Press -> Power OFF\r\n");
             // 立即停止其他所有蜂鸣
             if (beep_active) {
               HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_2);
@@ -402,6 +395,14 @@ int main(void)
               beep_sequence_step = 0;
             }
             RX_Beep_Shutdown_Sequence(); // 关机专属提示音
+          } else {
+            // 长按 (>=2秒)松开：开机 (PB5 = 高电平)
+            HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5, GPIO_PIN_SET);
+            manual_lock_off = 0;
+            printf("[BUTTON] Long Press -> Power ON\r\n");
+            if (!beep_active) {
+              RX_Beep_Start(100); // 开机提示音
+            }
           }
         }
       }
@@ -548,7 +549,7 @@ int main(void)
       }
       // 【修复】将静态变量定义在 if...else 外部，保证是同一个变量
       static uint8_t over_power_count = 0;
-      if (global_power_f > 15.0f) {
+      if (global_power_f > 30.0f) {
         // 非阻塞蜂鸣，避免系统阻塞
         if (!beep_active) {
           RX_Beep_Start(500);
