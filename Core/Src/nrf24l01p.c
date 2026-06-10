@@ -482,7 +482,13 @@ void NRF_Force_Write_Reg(uint8_t reg, uint8_t value) {
     // 必须加上 NRF24L01P_CMD_W_REGISTER (0x20)
     uint8_t buf[2] = { NRF24L01P_CMD_W_REGISTER | reg, value };
     cs_low();
-    HAL_SPI_Transmit(NRF24L01P_SPI, buf, 2, HAL_MAX_DELAY); // 两字节一口气发完，防止时序断裂
+    // 【新增】不能使用 HAL_MAX_DELAY。
+    // 如果 NRF 模块掉电、SPI 总线异常或 MISO/MOSI 被干扰，HAL_MAX_DELAY 可能让 MCU 永远卡在这里。
+    // 使用有限超时后，主循环还能继续运行，并触发上层 NRF_Health_Check/NRF_Recovery_Check 自恢复。
+    if (HAL_SPI_Transmit(NRF24L01P_SPI, buf, 2, 100) != HAL_OK) {
+        cs_high();
+        return;
+    }
     cs_high();
 }
 
@@ -491,7 +497,11 @@ uint8_t NRF_Force_Read_Reg(uint8_t reg) {
     uint8_t tx_buf[2] = { NRF24L01P_CMD_R_REGISTER | reg, 0xFF }; // 发送 dummy(0xFF) 换回真实数据
     uint8_t rx_buf[2] = { 0, 0 };
     cs_low();
-    HAL_SPI_TransmitReceive(NRF24L01P_SPI, tx_buf, rx_buf, 2, HAL_MAX_DELAY); // 边发边收
+    // 【新增】有限超时读取寄存器。失败时返回 0xFF，交给上层健康检查判断为 SPI/NRF 异常。
+    if (HAL_SPI_TransmitReceive(NRF24L01P_SPI, tx_buf, rx_buf, 2, 100) != HAL_OK) {
+        cs_high();
+        return 0xFF;
+    }
     cs_high();
     return rx_buf[1]; // 第二个字节才是我们要的寄存器值
 }

@@ -42,7 +42,7 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 
-#define NRF_PAIR_ID 0u
+#define NRF_PAIR_ID 4u
 
 static const uint8_t nrf_pair_addrs[][7] = {
    {0x12, 0x34, 0x56, 0x78, 0x9A}, // ID0
@@ -149,6 +149,10 @@ void RX_Beep(uint16_t duration_ms) {
 // ===================== NRF24L01 通信监控函数 =====================
 
 // NRF状态检查回调（每5秒调用一次）
+// 【新增】NRF_Health_Check() 位于 NRF_Apply_Safe_Config() 前面，
+// C11 不允许未声明就调用函数，所以这里先声明完整恢复函数。
+void NRF_Apply_Safe_Config(void);
+
 void NRF_Status_Check(void) {
   if (HAL_GetTick() - nrf_status_check_time > 5000) {
     nrf_status_check_time = HAL_GetTick();
@@ -164,22 +168,33 @@ void NRF_Health_Check(void) {
     
     uint8_t config = NRF_Force_Read_Reg(NRF24L01P_REG_CONFIG);
     uint8_t en_rxaddr = NRF_Force_Read_Reg(NRF24L01P_REG_EN_RXADDR);
-    uint8_t fifo = NRF_Force_Read_Reg(NRF24L01P_REG_FIFO_STATUS);
+    uint8_t rf_ch = NRF_Force_Read_Reg(NRF24L01P_REG_RF_CH);
+    uint8_t setup_aw = NRF_Force_Read_Reg(NRF24L01P_REG_SETUP_AW);
+    uint8_t en_aa = NRF_Force_Read_Reg(NRF24L01P_REG_EN_AA);
+    uint8_t feature = NRF_Force_Read_Reg(NRF24L01P_REG_FEATURE);
     
     uint8_t need_fix = 0;
+
+    // ===================== 【修改】RX 健康检查条件 =====================
+    // 旧逻辑会检查 FIFO_STATUS，并把 RX_EMPTY/TX_EMPTY 当作异常。
+    // 但空闲时 FIFO 本来就经常是 empty，这会导致 RX 每 30 秒误恢复一次，反而扰乱 NRF。
+    // 现在只检查“明确不应该变化”的关键配置寄存器。
+    if (config == 0xFF || config == 0x00) need_fix = 1; // SPI/NRF 掉线或锁死
     if ((config & 0x03) != 0x03) need_fix = 1;
     if ((en_rxaddr & 0x01) == 0) need_fix = 1;
-    if ((fifo & 0x11) != 0x00) need_fix = 1;
+    if (rf_ch != 100) need_fix = 1;          // 2500MHz -> RF_CH = 100
+    if ((setup_aw & 0x03) != 0x03) need_fix = 1;
+    if ((en_aa & 0x01) == 0) need_fix = 1;
+    if ((feature & 0x06) != 0x06) need_fix = 1;
+    // =================== 【修改结束】RX 健康检查条件 ===================
     
     if (need_fix) {
-      printf("[NRF] Health check: needs recovery\r\n");
-      nrf24l01p_flush_rx_fifo();
-      nrf24l01p_flush_tx_fifo();
-      NRF_Force_Write_Reg(NRF24L01P_REG_STATUS, 0x70);
-      config |= 0x03;
-      NRF_Force_Write_Reg(NRF24L01P_REG_CONFIG, config);
-      en_rxaddr |= 0x01;
-      NRF_Force_Write_Reg(NRF24L01P_REG_EN_RXADDR, en_rxaddr);
+      printf("[NRF] Health check: full recovery\r\n");
+      // 【修改】不再只修几个位，而是调用完整配置函数。
+      // 这样地址、FEATURE、DYNPD、EN_AA、FIFO、PRX 模式会全部重新写一遍。
+      NRF_Apply_Safe_Config();
+      nrf_last_rx_time = HAL_GetTick();
+      nrf_recovery_count = 0;
     }
   }
 }
@@ -214,7 +229,9 @@ void NRF_Apply_Safe_Config(void) {
 
   // 4. 屏蔽中断引脚并确保 PRX 模式位正确
   uint8_t config = NRF_Force_Read_Reg(NRF24L01P_REG_CONFIG);
-  config |= 0x70; // 屏蔽 MAX_RT / TX_DS / RX_DR 中断
+  // 【修改】恢复时不仅屏蔽 IRQ，还强制 PWR_UP=1、PRIM_RX=1。
+  // 这样即使 NRF CONFIG 寄存器被干扰清零，也能回到接收模式。
+  config |= 0x73; // MASK_IRQ(0x70) + PWR_UP(0x02) + PRIM_RX(0x01)
   NRF_Force_Write_Reg(NRF24L01P_REG_CONFIG, config);
 
   // 5. 清空 FIFO 和状态标志
@@ -327,6 +344,13 @@ int main(void)
 
   // 2. 调用统一安全配置函数（初始化与恢复共用同一套逻辑，保证行为一致）
   NRF_Apply_Safe_Config();
+
+  // ===================== 【新增】RX 恢复计时起点 =====================
+  // 旧逻辑只有收到第一包后 nrf_last_rx_time 才会大于 0。
+  // 如果上电后一直没收到 TX，恢复检查就不会启动。
+  // 初始化完成后立即赋值，让 RX 即使“开机后无包”也能周期性自恢复。
+  nrf_last_rx_time = HAL_GetTick();
+  // =================== 【新增结束】RX 恢复计时起点 ===================
 
   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_SET);
 
@@ -549,7 +573,8 @@ int main(void)
       }
       // 【修复】将静态变量定义在 if...else 外部，保证是同一个变量
       static uint8_t over_power_count = 0;
-      if (global_power_f > 30.0f) {
+      // 最大功率长时间断电保护
+      if (global_power_f > 50.0f) {
         // 非阻塞蜂鸣，避免系统阻塞
         if (!beep_active) {
           RX_Beep_Start(500);
